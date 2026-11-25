@@ -1,0 +1,148 @@
+# Partie 4 — Mesures, problèmes résolus, limites
+
+## Ce qu'on a mesuré
+
+Un principe du projet : **on ne dit pas « ça marche mieux » sans chiffre**. Chaque amélioration a été mesurée, souvent avec un script du dossier `bench/`.
+
+%cols 34,26,40
+| Mesure | Résultat | Comment |
+|---|---|---|
+| Vitesse de YOLOE | ≈ 26 ms par image (640 px) | Préchauffage puis 10 prédictions (cellule 4) |
+| Noms justes : YOLOE seul | 19 % | `bench/test_vignettes.py`, 74 vignettes annotées à la main |
+| + vérificateur | 59 % ; 19 intrus sur 24 écartés | même test |
+| + apprentissage | 80 % | même test, validation croisée 5 plis |
+| + exemples Open Images (poids 0,05) | ta pièce 79 % ; objets d'ailleurs 73 → 79 % | `bench/test_open_images.py`, 551 objets mis de côté |
+| YOLOE + prototypes Open Images (poids 0,5) | objets retrouvés 40 → 59 % ; noms justes 57 → 62 % | `bench/yoloe_open_images.py`, 571 objets jamais vus |
+| Surveillance | alerte en 1,6 s, visage trouvé, + 0,07 ms par image | `bench/test_surveillance.py` |
+| Qwen | réveil ≈ 5-6 s (24 s au 1er réveil juste après le lancement), 4 à 9 s par réponse, ≈ 8 mots/s | `bench/test_memoire_qwen.py` et tests de la boucle |
+| Mémoire graphique | pic 5 167 Mo sur 6 144 (avant : 5 593) | scénario du plantage rejoué |
+| Images par seconde | 1 caméra ≈ 21-27 ; 2 caméras ≈ 13-14 (secteur), ≈ 8,5 (batterie) ; pendant que Qwen réfléchit ≈ 11 | compteur du panneau, tests automatiques |
+| iPhone (DroidCam) | 1280 × 720, ≈ 21 images/s, trouvé en ≈ 3 s | test réel |
+| Voix | Whisper 0,25 s (GPU) / 3,9 s (CPU) ; Piper parle en 0,15 s ; Kokoro en 1,3 s | tests de la cellule 8 |
+| Vidéo R | 8 s filmées → 8,0 s de vidéo | test de la cellule 6b |
+
+:::attention Ce qui n'est PAS encore mesuré
+- **Les fausses alertes et les alertes manquées** sur un vrai scénario (entrer, sortir, poser et reprendre son téléphone). C'est **la** mesure la plus importante pour un produit de surveillance.
+- Le bot Telegram réel.
+- La précision sur d'autres pièces que la tienne : les 77 exemples viennent tous de ta webcam.
+:::
+
+## Les problèmes qu'on a rencontrés et comment on les a résolus
+
+Cette partie est précieuse à l'oral : elle montre que tu as **vraiment** construit et débogué le système.
+
+%cols 26,37,37
+| Problème | Cause | Solution |
+|---|---|---|
+| Le micro donnait n'importe quoi | Gain du micro trop fort : son écrêté (saturé) | « Internal Mic Boost » à 0, entrée à 35 % (`wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 0.35`) ; le code détecte aussi un micro saturé |
+| Whisper répétait une phrase en boucle | « Hallucination » sur du bruit | Filtre passe-haut, détection du silence, `no_repeat_ngram_size`, rejet des phrases trop répétitives |
+| Le vérificateur ne servait à rien | Le tokenizer du dépôt remplissait les phrases avec le n° 49407 : toutes les phrases semblaient identiques | Tokenizer CLIP standard `ViT-B-32` |
+| Grandes lignes parasites sur les contours | `masks.xy` reliait les morceaux d'un objet | Contours recalculés avec `cv2.findContours` |
+| Plantage du suivi | Le mode ReID « auto » n'est pas compatible avec YOLOE | `with_reid: False` |
+| Téléchargement de Qwen bloqué à 0 octet | Le système de téléchargement « xet » de Hugging Face | `HF_HUB_DISABLE_XET=1`, reprise avec `curl -C -`, vérification SHA256 |
+| Qwen refusait de se charger | Fichier unsloth : 6 couches non compressées non déclarées ; couches BF16 | Les deux réparations de `charger_qwen.py` |
+| Qwen cassé 2 fois sur 3 | Deux modèles chargés en même temps | Verrou `CHARGEMENT` |
+| La fenêtre se fermait (I puis V, 2 caméras) | Mémoire graphique pleine dans YOLOE | Whisper sur CPU quand Qwen est réveillé, mise en veille de Qwen, image sautée au lieu de planter |
+| « Personne » mal vue sur l'iPhone | Analyse de l'image réduite avec bandes noires (0,35 au lieu de 0,92) | Analyser l'original puis `recadrer()` |
+| Icônes blanches en haut de la fenêtre | Barre d'outils Qt sans polices | `cv2.WINDOW_GUI_NORMAL` (pas de barre) |
+| Fermer avec la croix plantait | Erreur OpenCV « NULL guiReceiver » | `getWindowProperty` dans un `try/except` |
+| Voix robotique au démarrage | espeak parlait pendant que Kokoro chargeait | Piper parle d'abord ; on attend jusqu'à 15 s plutôt qu'espeak |
+| Vidéos illisibles sur téléphone | cv2 ne sait pas écrire le H.264 | PyAV `libx264` |
+| Vidéo accélérée | Rythme de la fenêtre variable | Répéter ou sauter des images pour rester à l'heure |
+
+## Les limites honnêtes
+
+- **Réglé pour une pièce** : les seuils et les 77 exemples viennent de ta chambre et de ta webcam.
+- **Faux « chat »** vu à 0,41 sur l'iPhone face au clavier : risque de fausse alerte animal.
+- **Le code est dans un notebook** avec une fenêtre OpenCV : très bien pour un prototype, pas pour un produit (il faudrait un service qui tourne en fond et une interface web).
+- **Pas de caméras IP (RTSP)** : celles qu'utilisent les entreprises. Techniquement proche (une adresse `rtsp://...` dans `CONFIG["cameras"]`), mais pas testé.
+- **Aucun test automatique** complet ; `lancer()` fait environ 550 lignes.
+- **Qwen ralentit** la fenêtre pendant qu'il réfléchit (≈ 21 → 11 images/s) et la fige ≈ 1 s quand il se réveille.
+
+## Les licences : peut-on le vendre ?
+
+%cols 26,22,52
+| Composant | Licence | Conséquence pour une vente en code fermé |
+|---|---|---|
+| Ultralytics / YOLOE | AGPL-3.0 | **Bloquant** : il faut acheter la licence Enterprise d'Ultralytics, ou changer de détecteur |
+| MobileCLIP2 | apple-amlr | **Bloquant** : recherche seulement → à remplacer (par exemple SigLIP2, Apache-2.0) |
+| `mobileclip_blt.ts` (texte de YOLOE) | Apple | À vérifier |
+| Qwen3-VL, Whisper, transformers, PyTorch | Apache-2.0 / BSD | OK |
+| Kokoro, Piper | Apache-2.0 / MIT | OK ; voix Siwis CC-BY 4.0 : OK en **citant la source**. La voix « Tom » est AGPL : ne pas l'utiliser |
+| YuNet, SFace | à vérifier | |
+| Open Images V7 (exemples du vérificateur) | annotations CC BY 4.0, images CC BY 2.0 | OK en citant la source ; les images ne sont pas redistribuées (voir `dataset/open_images/LISEZMOI.md`) |
+| Données d'entraînement des modèles | Objects365 + GoldG (YOLOE), DFNDR (MobileCLIP2) | Conditions à vérifier avec un juriste |
+
+**Données personnelles (RGPD)** : filmer des personnes impose d'informer, de limiter la durée de conservation des clips et de sécuriser l'accès. La **reconnaissance faciale** (identifier qui est la personne) est très encadrée en Europe. Aujourd'hui Vision Live **détecte** un visage et le garde en photo, il ne l'**identifie** pas.
+
+## La suite prévue
+
+1. **Ton test réel** de la version corrigée (I, V, deux caméras, D).
+2. **Mesurer les fausses alertes** sur un scénario filmé.
+3. **Créer le bot Telegram** et le tester avec internet.
+4. **Fait le 31/10** : 1 544 images d'Open Images V7 → 3 187 exemples ; le vérificateur généralise mieux (73 → 79 % sur des objets d'ailleurs, ta pièce inchangée). **Suite** : des exemples « non-objets » venus d'ailleurs, et Qwen comme « professeur » qui pré-étiquette les objets douteux.
+5. **Préparer un produit** : licences, caméras RTSP, service + interface web, conformité RGPD.
+
+# Questions qu'on pourrait te poser
+
+### « Tu as entraîné ton propre modèle ? »
+Non, pas depuis zéro : ça demanderait des millions d'images et des semaines de calcul. J'utilise des modèles pré-entraînés (YOLOE, MobileCLIP2, Whisper, Qwen) et je les **adapte** : un adaptateur que j'entraîne sur mes corrections en 0,2 s, une mémoire kNN, et des prototypes qui modifient les signatures du détecteur. Ça fait passer la précision de 59 à 80 % sur mes vraies images.
+
+### « Pourquoi pas juste YOLO classique ? »
+YOLO classique ne connaît que 80 classes fixes (celles du jeu de données COCO). YOLOE accepte n'importe quelle liste d'objets en texte, et même un objet montré à la souris. J'en ai mis 230, dont des objets locaux (manioc, plantain, chaise en plastique).
+
+### « Pourquoi un deuxième modèle pour vérifier ? »
+Parce que YOLOE seul n'avait que 19 % de noms justes sur mes vraies images : il voit toute l'image réduite, l'objet n'y fait que quelques pixels. MobileCLIP2 regarde chaque objet de près, sans le fond, et rejette les mains, le flou, les murs.
+
+### « Comment les objets gardent-ils leur nom ? »
+Un suivi BoT-SORT donne un numéro à chaque objet d'une image à l'autre. Le nom est voté sur les 15 dernières images, le score est lissé, et il faut 3 images pour apparaître. Le seuil pour rester est plus bas que pour apparaître (hystérésis), donc ça ne clignote pas.
+
+### « Comment ça tient sur 6 Go de mémoire graphique ? »
+YOLOE et MobileCLIP2 en FP16 prennent 0,54 Go. Qwen est compressé en 4 bits (4,3 Go) et ne se charge qu'à la demande ; quand il est là, Whisper passe sur le processeur. Il se rendort après 2 minutes. J'ai mesuré le pic : 5,17 Go sur 5,6 utilisables.
+
+### « Pourquoi tout en local ? »
+Confidentialité (les images ne quittent pas le PC), pas d'abonnement, et ça marche sans internet (ma connexion est lente et souvent coupée). Seules les alertes Telegram ont besoin d'internet, et elles attendent sur le disque sinon.
+
+### « Comment tu as su que tes réglages étaient bons ? »
+J'ai annoté à la main 74 vraies détections et j'ai écrit un banc de test qui rejoue le vrai code du notebook. Chaque seuil a été choisi en mesurant. Pour l'apprentissage, j'ai utilisé une validation croisée pour ne pas tricher.
+
+### « Comment le clip peut-il commencer avant l'alerte ? »
+L'enregistreur garde en permanence les 10 dernières secondes dans un tampon circulaire de 100 images JPEG. Quand une alerte part, il copie ce tampon et continue 10 secondes.
+
+### « Qu'est-ce qui manque pour le vendre ? »
+Régler les licences (YOLOE en AGPL, MobileCLIP2 en recherche seulement), supporter les caméras IP, transformer le notebook en service avec une interface web, mesurer les fausses alertes, et respecter le RGPD.
+
+# Glossaire
+
+%cols 22,78
+| Mot | Explication |
+|---|---|
+| Adaptateur | Petite matrice W (512 × 512) entraînée sur tes corrections, ajoutée aux signatures du vérificateur |
+| API | Une façon pour deux programmes de se parler (ici : Telegram par des requêtes web) |
+| BoT-SORT | Algorithme de suivi d'objets d'une image à l'autre |
+| Boîte (xyxy) | Rectangle autour d'un objet : coin haut gauche (x1, y1), coin bas droit (x2, y2) |
+| CLIP | Modèle qui met images et textes dans le même espace de signatures |
+| CUDA | La technologie de NVIDIA pour calculer sur la carte graphique |
+| Dataset | Jeu de données d'exemples (images + bonnes réponses) |
+| EMA | Moyenne mobile exponentielle : `ema = 0,7 × ema + 0,3 × nouveau` |
+| Embedding / signature | Liste de nombres (ici 512) qui résume une image ou un texte |
+| Époque | Un passage complet sur tous les exemples pendant l'entraînement |
+| FP16 / BF16 / 4 bits | Façons de stocker les nombres avec moins de place |
+| H.264 | Format de compression vidéo lisible partout |
+| Hystérésis | Seuil d'apparition plus haut que le seuil de disparition, pour éviter le clignotement |
+| Inférence | Utiliser un modèle déjà entraîné |
+| IoU | Recouvrement de deux boîtes : surface commune / surface totale |
+| kNN | « k plus proches voisins » : on décide d'après les exemples les plus ressemblants |
+| Long polling | Requête que le serveur garde ouverte jusqu'à ce qu'il ait une réponse |
+| Masque | Les pixels exacts d'un objet (segmentation) |
+| Prompt visuel | Montrer un objet en image au lieu de le décrire en texte |
+| Prototype | Signature moyenne de tes images d'un objet, mélangée au texte dans YOLOE |
+| Régularisation | Pénalité qui empêche un modèle de trop s'éloigner de son point de départ |
+| Softmax | Fonction qui transforme des scores en probabilités |
+| Tampon circulaire | File de taille fixe : quand elle est pleine, le plus ancien élément sort |
+| Thread | Fil d'exécution qui avance en parallèle dans le programme |
+| Tokenizer | Découpe un texte en numéros de mots pour le modèle |
+| Validation croisée | Tester sur des exemples jamais vus à l'entraînement, en tournant les paquets |
+| VLM | Modèle de langage qui comprend aussi les images (Qwen3-VL) |
+| Vocabulaire ouvert | Détecteur à qui on donne la liste des objets à chercher, au lieu d'une liste fixe |
+| VRAM | Mémoire de la carte graphique |

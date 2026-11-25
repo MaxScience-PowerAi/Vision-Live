@@ -1,0 +1,241 @@
+# La surveillance (cellule « 7c) »)
+
+## Les zones
+
+Touche **Z** : tu cliques les coins d'un polygone, Entrée, puis tu tapes son nom (« bureau », « porte »). Retour efface le dernier coin, ou la dernière zone.
+
+- Les coins sont enregistrés en **fractions de l'image** (`x / largeur`, `y / hauteur`, arrondis à 4 chiffres) : la zone reste juste si la résolution change.
+- Chaque caméra a son fichier : `config/zones.json` pour la webcam, `config/zones_iphone.json` pour l'iPhone.
+- « Cet objet est-il dans la zone ? » : on teste si le **centre de sa boîte** est dans le polygone avec `cv2.pointPolygonTest` (≥ 0 = dedans ou sur le bord).
+- Sans aucune zone dessinée, **toute l'image** est surveillée (la zone s'appelle alors « image »).
+
+## Les règles
+
+Elles sont écrites dans la liste `REGLES`. On peut en ajouter ou les modifier sans toucher au reste :
+
+```
+{"nom": "intrus", "type": "presence", "objets": ["personne"], "zones": "*", "duree": 1.5, "pause": 60}
+{"nom": "animal", "type": "presence", "objets": ANIMAUX, "zones": "*", "duree": 2.0, "pause": 120}
+{"nom": "objet disparu", "type": "disparition", "objets": OBJETS_PRECIEUX, "zones": "*",
+ "present": 5, "absent": 5, "pause": 30}
+```
+
+- **présence** : un objet de la liste reste dans la zone pendant `duree` secondes → alerte.
+- **disparition** : un objet précieux (téléphone, ordinateur portable, portefeuille, tablette, clé) est resté `present` secondes (il est « installé »), puis n'est plus vu depuis `absent` secondes → alerte. Si une personne est visible à ce moment, le message le précise.
+- `pause` : délai minimum entre deux alertes pour la même chose (pas de rafale).
+- `horaires` : `None` = tout le temps, ou `("23:00", "06:00")`. La fonction `dans_horaires` gère le cas qui **passe minuit** : si début > fin, c'est « après le début OU avant la fin ».
+- `CONFIG["surv_auto"]` peut armer automatiquement la surveillance à certaines heures.
+
+[[fig:regles|112]]
+
+### L'algorithme (`Surveillance.maj`, appelée à chaque image analysée)
+
+Il tient un dictionnaire d'**états**, avec une clé par (règle, zone, objet) :
+
+1. Pour chaque règle, on liste les objets **sûrs** (pas incertains) concernés, et leurs zones.
+2. Objet vu → `etat["vu"] = maintenant` (et `etat["depuis"]` si c'est nouveau).
+3. Présence : si `maintenant - depuis ≥ duree` → **déclencher**.
+4. Disparition : si `maintenant - depuis ≥ present` → l'objet est « installé ».
+5. Pour les clés **non vues** à cette image : si l'objet était installé et absent depuis `absent` secondes → **déclencher** ; sinon, absent depuis plus d'1 s → on oublie (on repart de zéro).
+
+**G** arme la surveillance **dans 10 secondes** (le temps de sortir de la pièce) et sur **toutes** les caméras. G à nouveau la désarme.
+
+## Déclencher une alerte (`_declencher`)
+
+1. Vérifie la `pause`.
+2. Crée un dossier `evenements/AAAAMMJJ_HHMMSS_<camera>_<regle>/`.
+3. Enregistre `image.jpg` : l'image du moment, avec les boîtes (rouge pour les objets de la règle) et la zone.
+4. Démarre l'**enregistrement** du clip.
+5. Envoie tout de suite l'alerte « Présence : personne dans la zone porte (iphone) » avec la photo, sans attendre le clip.
+6. Avec Qwen : il rédige une description, enregistrée dans `description.txt` et envoyée sur Telegram (voir le chapitre Qwen).
+
+## L'Enregistreur : 10 secondes avant, 10 secondes après
+
+Comment avoir un clip qui commence **avant** l'alerte ? En gardant **en permanence** les 10 dernières secondes.
+
+- Le thread de l'enregistreur reçoit **10 images par seconde** (`surv_fps`), réduites à 960 pixels de large, avec les boîtes et l'heure dessinées, compressées en **JPEG** (une image JPEG prend environ 10 fois moins de mémoire qu'une image brute).
+- Elles vont dans un **tampon circulaire** : une `deque(maxlen=100)` (10 s × 10 images/s). Quand elle est pleine, la plus ancienne image sort toute seule.
+- Au déclenchement : l'événement **copie le tampon** (les 10 s d'avant), puis continue d'ajouter les images pendant 10 s. Une nouvelle alerte pendant l'enregistrement **prolonge** le même clip.
+- À la fin : le clip est écrit en **H.264** avec PyAV (`crf 26`, `preset veryfast`) dans `clip.mp4`, avec `info.json` (règle, zone, objets, début, durée, visage oui/non). Puis il est envoyé.
+
+### Le meilleur visage
+
+Pendant l'événement, pour chaque personne, on cherche un visage dans le **haut de sa boîte** (60 % supérieurs) avec **YuNet** (`cv2.FaceDetectorYN`, confiance ≥ 0,80). Chaque visage reçoit une note :
+
+```
+note = confiance × racine(largeur × hauteur)          # sûr ET grand = net
+```
+
+On garde le visage de meilleure note (avec une marge de 40 %) → `visage.jpg`, envoyé sur Telegram.
+
+## Les alertes Telegram (classe `Alertes`)
+
+Telegram fournit une **API** : on parle au bot avec de simples requêtes web (`https://api.telegram.org/bot<jeton>/<méthode>`), faites avec `requests`.
+
+**L'envoi** (thread `_envoi`) :
+
+1. Chaque alerte est d'abord **écrite sur le disque** (`evenements/alertes_en_attente.jsonl`) : rien n'est perdu si internet est coupé ou si le programme s'arrête.
+2. Si le bot est configuré, on envoie dans l'ordre (`sendVideo`, `sendPhoto` ou `sendMessage`) ; chaque alerte envoyée est retirée du fichier. En cas d'erreur, on s'arrête et on réessaie plus tard.
+3. Sans jeton, le fichier `config/telegram.json` est relu toutes les 20 s : on peut ajouter le jeton pendant que le programme tourne.
+
+**L'écoute** (thread `_ecoute`) utilise le **« long polling »** : `getUpdates` avec `timeout=25` ; Telegram garde la requête ouverte jusqu'à 25 s et répond dès qu'un message arrive. `offset` évite de relire les anciens messages.
+
+- **Le premier chat** qui écrit au bot en devient le **propriétaire** (son numéro est enregistré). Les autres sont ignorés.
+- Commandes : `/photo` (image de toutes les caméras côte à côte, sauf les coupées), `/armer`, `/desarmer`, `/etat`, `/events` (10 dernières alertes), `/scene` (Qwen décrit l'image).
+
+:::attention Pas encore testé
+Le bot Telegram n'a **jamais été testé avec un vrai bot** : il faut le créer avec @BotFather et une connexion internet. Avec le partage de connexion de l'iPhone (sans données mobiles), le PC n'a pas internet : les alertes attendent dans le fichier.
+:::
+
+# La voix (cellule « 8) »)
+
+## Entendre : micro → Whisper → texte (classe `Voix`)
+
+1. **V** lance `arecord` : son en **16 000 Hz, mono, 16 bits**, 6 secondes au maximum (V à nouveau pour arrêter avant). On l'arrête avec le signal SIGINT pour que le fichier WAV soit bien fermé.
+2. **Nettoyage du son** (`_transcrire`) :
+   - on retire la moyenne (le « décalage » continu du micro) ;
+   - moins de 0,4 s → rien ;
+   - plus de 5 % des échantillons à fond (> 0,99) → **micro saturé**, on le dit ;
+   - **filtre passe-haut** de Butterworth d'ordre 4 à 120 Hz : il enlève les ronflements graves (ventilateur, secteur) ;
+   - volume moyen (RMS) < 0,002 → silence ;
+   - on **normalise** le volume (le pic à 0,9).
+3. **Whisper small** (pipeline `automatic-speech-recognition` de transformers), en français, 40 mots au maximum, `no_repeat_ngram_size=3` (interdit de répéter 3 mots d'affilée).
+4. **Anti-hallucination** : sur du bruit, Whisper invente parfois une phrase répétée en boucle. Si la phrase a au moins 6 mots et moins de 40 % de mots différents, on la jette.
+
+Tout se passe dans des threads : la vidéo ne gèle jamais. Whisper tourne sur le GPU (0,25 s par phrase). Quand Qwen se réveille, Whisper **déménage sur le processeur** (environ 4 s par phrase) pour lui laisser la place, puis revient (`deplacer()`).
+
+## Comprendre : les intentions
+
+`comprendre(texte)` devine ce que tu veux, **sans IA**, avec des règles :
+
+1. **Normaliser** : minuscules, sans accents, apostrophes et tirets remplacés par des espaces, seulement lettres et chiffres. « Où est mon téléphone ? » → `ou est mon telephone`.
+2. Tester les **intentions dans l'ordre** ; la première dont un déclencheur est présent gagne :
+
+%cols 16,84
+| Action | Déclencheurs (extraits) |
+|---|---|
+| corriger | « non c est », « ce n est pas », « c est un » |
+| oublier | « oublie » |
+| ou | « ou est », « tu as vu », « ou j ai mis » |
+| chercher | « trouve », « cherche », « montre moi », « localise » |
+| combien | « combien » |
+| decrire | « qu est ce que tu vois », « decris » |
+| stop | « arrete », « stop », « annule » |
+| mission, hd, mode | « mission » ; « haute precision » ; « mode nuit / spotlight / chaleur / normal » |
+
+3. **Trouver l'objet** (`trouver_objet`) : on enlève les petits mots (mon, la, des...), puis on cherche le **nom connu le plus long** présent dans la phrase (« clé USB » avant « clé »), avec un « s » facultatif. Sinon, on tolère les fautes de Whisper avec `difflib.get_close_matches` (ressemblance ≥ 0,75 sur la phrase, puis ≥ 0,8 sur des groupes de 3, 2 et 1 mots).
+4. Cas spéciaux : « ce n'est pas un téléphone, c'est un routeur » → on garde ce qui suit le **dernier** « c'est » ; « ce n'est pas un objet », « c'est ma main » → `REJET`.
+5. Sans intention mais avec un objet connu → « où est » ; sinon → `inconnu` (et la question part chez Qwen).
+
+## Parler : la synthèse vocale (classe `Parole`)
+
+- **Piper** (voix Siwis) se charge en environ 3 s et parle en **0,15 s** ; **Kokoro** (voix `ff_siwis`) est plus naturel mais plus lent à charger (6 à 15 s) et commence à parler en environ **1,3 s**.
+- Au démarrage, Piper parle pendant que Kokoro se charge ; ensuite c'est la voix choisie (`CONFIG["voix_moteur"]`). La vieille voix robot (`spd-say` / espeak) ne sert qu'en dernier secours.
+- **Phrase par phrase** : le texte est coupé après « . ! ? … » ; la 1re phrase est jouée pendant que la suivante est fabriquée. Deux fichiers WAV en alternance, joués par `paplay`.
+- **Une nouvelle réponse coupe l'ancienne** : chaque demande reçoit un numéro ; les morceaux d'une demande périmée sont abandonnés.
+
+:::attention Un seul chargement à la fois
+Pendant qu'il charge un modèle, `transformers` change un réglage **commun à tout le programme**. Deux chargements en même temps (Qwen et Whisper par exemple) se marchaient dessus : Qwen cassé 2 fois sur 3 (« Float and Half »). D'où le verrou `CHARGEMENT` partagé par Whisper, Kokoro, Piper et Qwen.
+:::
+
+# Le niveau 4 : Qwen, l'expert (cellule « 8b) »)
+
+## Ce qu'est Qwen3-VL
+
+Un **VLM** (« Vision-Language Model ») : un modèle de langage, comme un chatbot, qui accepte aussi des **images**. L'image est découpée en petits carrés, transformés en signatures que le modèle lit comme des mots. Il peut donc **raisonner** sur la scène : « que fait la personne ? », « de quelle couleur est sa chemise ? ». YOLOE, lui, ne sait que lister des objets.
+
+Version utilisée : **Qwen3-VL-4B-Instruct** (4 milliards de paramètres), compressée en **4 bits** par unsloth : 4,3 Go sur la carte. Très bon en français. Choisi parce qu'il tourne **en local** (pas de clé d'API payante, pas d'envoi d'images sur internet).
+
+## Le charger : deux réparations (`~/Modeles_IA/charger_qwen.py`)
+
+1. Le fichier publié **oublie** de dire que 6 couches de la partie vision (`deepstack_merger_list.*.linear_fc1/fc2`) ne sont **pas** compressées. transformers les prépare en 4 bits → plantage. Réparation : après le chargement, on remplace ces 6 couches par de vraies couches FP16 dont on lit les poids directement dans le fichier (`safe_open`).
+2. Quelques couches restent en **BF16**, que la carte gère mal (« Input BFloat16 / bias Half ») → converties en FP16, **en passant par la mémoire du PC** : le vocabulaire fait 742 Mo, le convertir sur la carte la faisait déborder.
+
+`demander(qwen, image, question)` : l'image est réduite à **640 pixels** au maximum (à 320, Qwen invente des détails : « sourit à la caméra »), mise dans un message de chat avec la question (`apply_chat_template`), puis `generate(..., do_sample=False)` : réponse **déterministe** (le mot le plus probable à chaque fois). Réponse en 4 à 9 s, environ 8 mots (« tokens ») par seconde.
+
+## La classe `Expert`
+
+Qwen tourne dans **son thread**, avec une file de questions. États : absent → chargement → prêt → réflexion → prêt...
+
+- **Réveil au premier besoin** (touche I, question difficile, ou surveillance armée) : Whisper part d'abord sur le processeur, puis Qwen se charge (sous le verrou `CHARGEMENT`).
+- **Il le dit tout de suite** : « Un instant, je réveille Qwen et je regarde. »
+- **Mise en veille** : après **120 s** sans question, Qwen est déchargé (`decharger` : mémoire libérée) et Whisper revient sur la carte, **sauf** si la surveillance est armée (`garder_eveille`).
+- **Préchauffage du disque** : au démarrage, un thread lit le fichier de Qwen (4 Go) doucement, sans le charger : il reste dans le cache du système et le réveil passe d'environ 20 s à environ 5 s.
+- **Mémoire pleine** : on vide le cache du GPU et on réessaie une fois.
+
+### Qui répond : YOLOE ou Qwen ?
+
+`pour_expert(texte)` repère les questions qui demandent de **comprendre** : « que se passe », « explique », « que fait », « quelle couleur », « pourquoi », « qui est », « est-ce que quelqu'un »... Ces questions, et toutes celles que `comprendre()` ne reconnaît pas, partent chez Qwen avec la consigne « Réponds en français, en une ou deux phrases courtes. ». « Où est mon téléphone ? » reste une réponse rapide (mémoire).
+
+### `SurveillanceExperte`
+
+Une **sous-classe** de `Surveillance` (elle hérite de tout et ajoute des choses) : à chaque alerte, Qwen décrit la personne ou l'animal (apparence, vêtements, ce qu'il tient) → `description.txt` + message Telegram. Elle ajoute aussi la commande `/scene`, qui attend la réponse (90 s au maximum) grâce à un `threading.Event`.
+
+## Le budget de mémoire graphique
+
+[[fig:memoire|150]]
+
+Tout chargé sur la carte, le pic atteignait 5 593 Mo sur 6 144 : ça tenait, de justesse. En vrai, avec deux caméras et la voix, la carte a **débordé** : la fenêtre s'est fermée (30/10 au soir). Depuis : Whisper passe sur le processeur quand Qwen est réveillé, Qwen s'endort tout seul, et une image en trop est sautée au lieu de planter. Pic mesuré en rejouant le scénario : **5 167 Mo**.
+
+:::oral Qwen en 30 secondes
+« Pour les questions qui demandent de comprendre, j'utilise Qwen3-VL, un modèle vision-langage de 4 milliards de paramètres compressé en 4 bits. Il tourne en local, se réveille à la demande, décrit chaque alerte, et se rendort au bout de deux minutes pour libérer la carte graphique. J'ai dû réparer deux défauts du fichier publié pour pouvoir le charger. »
+:::
+
+# La fenêtre et la boucle (cellules 9 et 10)
+
+## Une image de la boucle
+
+[[fig:boucle|150]]
+
+La fonction `lancer()` crée tout (journal, mémoire, caméras, perceptions, zones, surveillances, commandes Telegram), ouvre la fenêtre puis tourne dans une boucle `while True`. À chaque tour :
+
+1. **Perception** sur chaque caméra allumée : lire, analyser, mettre à jour la mémoire, la heatmap, la surveillance (les alertes sont dites et notées), le journal et les traînées.
+2. **Rendu** de la caméra affichée : mode 1 à 4, zones, traînées, contours, étiquettes, verrouillage de la cible recherchée, bandeaux (caméra coupée ou déconnectée), heure, vignettes des autres caméras, surveillance, état de Qwen, mission.
+3. **Panneau** à droite (`dessiner_panneau`) : images/s, ms, réglages, nombre de corrections, surveillance, Qwen, objets en direct (barres), assistant (question et réponse), mission, journal, aide des touches.
+4. `cv2.imshow` (+ écriture de la vidéo si R).
+5. **Voix et Qwen** : on relit leurs files de résultats.
+6. **Clavier** : `cv2.waitKey(1)`. La fenêtre fermée avec la croix est détectée (`getWindowProperty`).
+
+## Les modes de l'interface
+
+La variable `ui["mode"]` dit dans quel état est l'interface : **normal**, **dessin** (entourer un objet avec A ou C), **saisie** (taper un nom, une question, un nom de zone), **revision** (touche E), **zone** (cliquer des coins). Le clavier et la souris ne font pas la même chose selon le mode : c'est une **machine à états**. Pendant le dessin et la correction, l'image est **figée** (`ui["gele"]`) pour que l'objet ne bouge pas sous la souris.
+
+## Toutes les touches
+
+%cols 14,86
+| Touche | Action |
+|---|---|
+| V | Parler (V à nouveau ou 6 s pour finir) |
+| F | Écrire une question |
+| I | Qwen : « que se passe-t-il ? » sur l'image en direct |
+| G | Surveillance : armer (dans 10 s) / désarmer, toutes les caméras |
+| Z | Dessiner une zone (clics, Entrée, nom) |
+| Tab | Caméra suivante en grand |
+| D | Couper / rallumer la caméra affichée |
+| C | Corriger : clic sur l'objet → 1, 2, 3 (propositions), X (pas un objet) ou taper le nom |
+| E | Réviser les objets douteux (Espace = passer) |
+| U | Entraîner maintenant sur les corrections |
+| A | Apprendre un objet perso (entourer, nom, Entrée) |
+| 1 à 4 | HUD, Spotlight, Heatmap, Vision nocturne |
+| H | Haute précision (YOLOE à 960 px) |
+| M | Mission |
+| + / - | Seuil de confiance (par pas de 0,05) |
+| T / S / R | Traînées / capture d'écran / vidéo |
+| Q ou Échap | Quitter (le clip en cours est terminé proprement) |
+
+## La fin propre (`finally`)
+
+Quoi qu'il arrive (Q, croix, erreur), le bloc `finally` : arrête le micro, termine les clips en cours, arrête les caméras, ferme la vidéo, ferme le journal, **sauvegarde la mémoire**, ferme la fenêtre. Puis il affiche un bilan : objets suivis, fausses détections écartées, corrections, alertes par caméra, reconnexions, alertes en attente, réponses de Qwen.
+
+# Lancer le programme
+
+`lancer_vision.py` :
+
+1. trouve le notebook (ou, s'il a disparu, la sauvegarde la plus récente) ;
+2. lit ses cellules de code, **sauf** les cellules d'installation (`%pip`, `!`) et celles qui appellent `lancer()` ;
+3. les exécute **dans l'ordre**, dans un même espace de noms (`exec`) : c'est comme si on les lançait une par une dans Jupyter ;
+4. appelle `lancer()`.
+
+`vision_live.sh` (l'icône du bureau) affiche une notification, lance ce script avec le Python de `ai_master` et écrit tout dans `logs/lanceur.log`. En cas d'erreur : une notification rouge. Les tests du dossier `bench/` utilisent le même mécanisme : ils testent **le vrai code du notebook**, pas une copie.
+
+Démarrage complet : environ 15 à 25 secondes (YOLOE, MobileCLIP2, préchauffage, adaptateur, voix en arrière-plan).

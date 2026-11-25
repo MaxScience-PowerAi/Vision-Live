@@ -1,0 +1,176 @@
+# Comment lire ce guide
+
+Ce guide explique **tout** Vision Live : ce qu'il fait, avec quoi il est construit, comment chaque morceau marche, pourquoi on a fait chaque choix, ce qu'on a mesuré et ce qui ne marche pas encore. Le but : que tu puisses l'expliquer à quelqu'un **comme si tu l'avais codé toi-même, ligne par ligne**.
+
+Il est organisé en quatre parties :
+
+1. **Vue d'ensemble** : ce que fait le programme, le matériel, les bibliothèques, l'architecture, les fichiers.
+2. **Les notions de base** : pixels, réseaux de neurones, signatures (« embeddings »), probabilités, GPU... Tout ce qu'il faut comprendre AVANT de lire le code, expliqué simplement.
+3. **Le code, cellule par cellule** : chaque partie du notebook, avec ses algorithmes, ses formules et des extraits du vrai code.
+4. **Mesures, problèmes résolus, limites et suite** : les chiffres, les bugs qu'on a corrigés (et comment), les licences, et une liste de questions qu'on pourrait te poser, avec les réponses.
+
+Conseil : lis d'abord la partie 1 et la partie 2 en entier. Ensuite, lis la partie 3 avec le notebook ouvert à côté : chaque chapitre correspond à une cellule.
+
+:::oral Tout le projet en 30 secondes
+« Vision Live, c'est une caméra intelligente qui tourne entièrement sur mon PC, sans cloud. Elle reconnaît environ 230 objets en temps réel, vérifie chaque détection avec un deuxième modèle, apprend de mes corrections, se souvient où elle a vu chaque objet, me répond à la voix, surveille une pièce avec des règles (intrus, animal, objet volé), enregistre un clip avec le visage, m'alerte sur Telegram, et peut faire appel à un modèle de langage visuel, Qwen, pour décrire une scène en français. Elle marche avec la webcam et un iPhone en même temps. »
+:::
+
+Dans ce guide, les noms de fonctions, de fichiers et de réglages sont écrits `comme ceci`. Les encadrés bleus résument ce qu'il faut retenir, les verts te donnent une phrase toute faite pour l'expliquer à l'oral, les orange signalent un piège.
+
+# Partie 1 — Ce que fait Vision Live
+
+## Les fonctions, une par une
+
+%cols 22,78
+| Fonction | Ce que ça fait concrètement |
+|---|---|
+| Voir | Repère et **détoure** (contour exact, pas seulement un rectangle) environ 230 objets décrits en texte : personne, téléphone, clé, tasse, chat... à environ 26 ms par image sur la carte graphique. |
+| Vérifier | Un deuxième modèle regarde **chaque objet de près** (seulement ses pixels) et confirme, corrige ou rejette (une main, du flou, un mur pris pour un objet). |
+| Suivre | Chaque objet garde un **numéro** d'une image à l'autre ; son nom est décidé par un **vote** sur les 15 dernières images, donc il ne « saute » pas. |
+| Avouer le doute | Quand il hésite entre deux noms proches, il affiche `aliment (pain ?)` en couleur éteinte, au lieu d'inventer. |
+| Apprendre | Tu corriges un objet (touche C ou à la voix « non, c'est un cordon badge ») : effet **immédiat** (niveau 2), puis il **s'entraîne** sur tes corrections (niveau 3). |
+| Objets perso | Tu entoures **ton** objet à la souris (touche A) : il le reconnaît ensuite, en doré. |
+| Se souvenir | « Où est mon téléphone ? » → « J'ai vu téléphone il y a 4 minutes, à gauche de l'image, près de : ordinateur portable. » |
+| Écouter et parler | Touche V : tu parles, Whisper transcrit en français ; il répond avec une voix naturelle (Kokoro ou Piper). |
+| Surveiller | Touche G : il s'arme dans 10 s. Règles : intrus, animal, objet précieux disparu, éventuellement dans des **zones** dessinées (touche Z). Chaque alerte : photo, clip de 20 s, meilleur visage, description. |
+| Alerter | Envoie les alertes sur **Telegram** ; sans internet, elles attendent dans un fichier et partent plus tard. Le bot répond à /photo, /armer, /scene... |
+| Comprendre | Niveau 4 : **Qwen3-VL-4B**, un modèle qui comprend l'image et répond en français (« que fait la personne ? »). Touche I. |
+| Plusieurs caméras | Webcam + iPhone (application DroidCam) **en même temps**. Tab change la caméra affichée, D la coupe ou la rallume. |
+| Filmer | Touche R : enregistre l'écran en vidéo H.264, lisible partout. |
+
+## Le matériel
+
+- **PC portable sous Linux** (Ubuntu), avec une carte graphique **NVIDIA Quadro RTX 3000** : 6 Go de mémoire, dont **5,6 Go réellement utilisables**. C'est la contrainte principale du projet : tout doit tenir dedans.
+- **Webcam** intégrée (`/dev/video0`), réglée en 1280 × 720.
+- **iPhone** avec l'application **DroidCam** : il envoie sa caméra par le Wi-Fi (adresse `http://IP:4747/video`), en 1280 × 720 à environ 21 images par seconde.
+- **Micro** interne. Il saturait : on a baissé le gain (voir partie 4).
+- Connexion internet lente et coupures fréquentes : tous les modèles sont **sur le disque**, Vision Live marche **hors ligne**.
+
+## L'environnement logiciel
+
+Tout tourne dans un **environnement conda** appelé `ai_master` (Python 3.11.18), avec **CUDA 12.6** pour la carte graphique. Un environnement conda, c'est un dossier qui contient sa propre copie de Python et de ses bibliothèques, pour que les projets ne se marchent pas dessus.
+
+Le code vit dans **un seul notebook Jupyter** : `~/Documents/Vision_Live/Vision_Live.ipynb`. Un script, `lancer_vision.py`, exécute ses cellules dans l'ordre et ouvre la fenêtre : c'est lui que lance l'icône du bureau.
+
+## Les bibliothèques (dépendances)
+
+%cols 19,10,49,22
+| Bibliothèque | Version | À quoi elle sert dans Vision Live | Licence |
+|---|---|---|---|
+| `torch` (PyTorch) | 2.14.1 | Calcul sur la carte graphique, réseaux de neurones, entraînement de l'adaptateur | BSD (libre) |
+| `ultralytics` | 8.4.191 | Fournit **YOLOE** et le suivi **BoT-SORT** | **AGPL-3.0** (problème pour vendre, voir partie 4) |
+| `lap` | 0.5.13 | Algorithme d'affectation utilisé par le suivi (qui est qui d'une image à l'autre) | BSD |
+| `open_clip_torch` | 3.3.0 | Charge **MobileCLIP2** (le vérificateur) | MIT |
+| `timm` | 1.0.30 | Briques de réseaux d'images ; `reparameterize_model` accélère MobileCLIP2 | Apache-2.0 |
+| `transformers` | 5.21.0 | Charge **Whisper** (voix → texte) et **Qwen3-VL** | Apache-2.0 |
+| `accelerate`, `safetensors`, `huggingface_hub` | 1.15 / 0.8 / 2.3 | Chargement des gros modèles et lecture des fichiers de poids | Apache-2.0 |
+| `bitsandbytes` | 0.50.2 | Calcul en **4 bits** : Qwen tient en 4,3 Go au lieu d'environ 9 | MIT |
+| `opencv-python` (cv2) | 5.0.0 | Caméras, dessin, fenêtre, détection de visages **YuNet**, géométrie | Apache-2.0 |
+| `numpy` | 2.4.6 | Calcul sur des tableaux de nombres (images, probabilités) | BSD |
+| `av` (PyAV) | 18.1.0 | Écrit les vidéos en **H.264** (le cv2 installé ne sait pas le faire) | BSD |
+| `requests` | 2.34.2 | Parle à l'API de **Telegram** | Apache-2.0 |
+| `kokoro` | 0.9.4 | Voix de réponse naturelle (82 millions de paramètres) | Apache-2.0 |
+| `piper-tts` (+ `onnxruntime`) | 1.8.0 | Voix de réponse instantanée | MIT |
+| `soundfile`, `scipy` | 0.14 / 1.17 | Lire et écrire les sons ; filtre passe-haut sur le micro | BSD |
+| `pillow` (PIL) | 12.3.0 | Format d'image attendu par MobileCLIP2 et Qwen | HPND (libre) |
+
+Outils du système (pas Python) : `arecord` (enregistre le micro), `paplay` (joue le son), `spd-say` (vieille voix robot de secours), `notify-send` (notifications du bureau).
+
+## Les modèles d'IA
+
+Tous les modèles sont rangés dans un dossier commun à tous tes projets : `~/Modeles_IA/` (avec un fichier `LISEZMOI.md`). Le dossier `Vision_Live/models` est juste un lien vers lui.
+
+%cols 21,11,44,24
+| Modèle | Taille | Rôle | Licence |
+|---|---|---|---|
+| **YOLOE-11m-seg** (Ultralytics) | 58 Mo | Détecteur à **vocabulaire ouvert** : on lui donne les objets à chercher en texte (ou en image) ; il rend boîtes + masques | AGPL-3.0 |
+| `mobileclip_blt.ts` | 572 Mo | L'encodeur de **texte** dont YOLOE se sert pour transformer « cell phone » en signature | Apple (à vérifier) |
+| **MobileCLIP2-S2** (Apple) | ~0,4 Go | Le **vérificateur** : compare l'image d'un objet à des phrases | apple-amlr (**recherche seulement**) |
+| **Whisper small** (OpenAI) | ~0,9 Go | Reconnaissance de la parole en français | Apache-2.0 (MIT d'origine) |
+| **Qwen3-VL-4B-Instruct** 4 bits (Alibaba, version unsloth) | 4,3 Go | Le « cerveau expert » : comprend l'image, répond en français | Apache-2.0 |
+| **YuNet** + SFace (OpenCV) | 38 Mo | Trouver les visages (YuNet) ; SFace est prêt pour reconnaître des visages connus (pas encore utilisé) | à vérifier |
+| **Kokoro** + voix `ff_siwis` | 313 Mo | Voix de réponse naturelle | Apache-2.0 / voix CC-BY 4.0 |
+| **Piper** `fr_FR-siwis-medium` | 63 Mo | Voix de réponse instantanée | MIT / voix CC-BY 4.0 |
+
+:::retenir Ce qu'il faut savoir dire sur les modèles
+On n'a **entraîné aucun modèle depuis zéro**. On utilise des modèles **pré-entraînés** par leurs auteurs sur des millions d'images, de textes ou d'heures de son. Notre travail, c'est de les **assembler**, de les **faire coopérer**, de **corriger leurs erreurs** (vérificateur, vote, mémoire) et de les **adapter à ta pièce** avec tes propres corrections (77 exemples aujourd'hui).
+:::
+
+# L'architecture
+
+## Le schéma général
+
+[[fig:architecture|290]]
+
+Lis le schéma de gauche à droite :
+
+1. Chaque **caméra** a son propre fil d'exécution (« thread ») qui lit le flux en continu et ne garde que l'image la plus récente.
+2. Chaque caméra a sa propre **Perception** : YOLOE trouve les objets, le suivi leur donne un numéro, le vote stabilise leur nom, le vérificateur les confirme ou les rejette.
+3. Les objets fiables partent vers l'**affichage**, la **mémoire** (« où est X »), la **surveillance** (règles → alertes) et **Telegram**.
+4. En bas : la **voix** transforme ta question en texte, la **compréhension** devine ce que tu veux. Si c'est une question difficile, elle part chez **Qwen**, qui décrit aussi chaque alerte.
+
+## Plusieurs choses en même temps : les threads
+
+Un programme normal fait une chose après l'autre. Vision Live, lui, doit lire deux caméras, analyser, dessiner, écouter le micro, parler, envoyer des messages et faire réfléchir Qwen **en même temps**, sans que la fenêtre gèle. Pour ça, il utilise des **threads** : des fils d'exécution qui avancent en parallèle dans le même programme.
+
+[[fig:threads|190]]
+
+Les threads communiquent par des **files d'attente** (`queue.Queue`) : l'un dépose un travail, l'autre le prend quand il est prêt. Exemple : la boucle principale dépose « vérifie cet objet » dans la file du vérificateur et continue tout de suite ; le vérificateur traite les demandes par lots de 16 et range les résultats dans un dictionnaire que la boucle relit à l'image suivante.
+
+Quand deux threads touchent la même donnée, on la protège avec un **verrou** (`threading.Lock`) : un seul à la fois. Le plus important s'appelle `CHARGEMENT` : un seul modèle se charge à la fois (on verra pourquoi en partie 4).
+
+:::retenir Règle d'or de l'architecture
+**La boucle de la fenêtre ne doit jamais attendre.** Tout ce qui est lent (lire le réseau, vérifier, transcrire, parler, Qwen, Telegram, encoder une vidéo) part dans un thread. Si un thread est en retard, on **saute** un travail plutôt que de ralentir l'image (`put_nowait` + `queue.Full`).
+:::
+
+# Les fichiers du projet
+
+## Le dossier Vision_Live
+
+```
+~/Documents/Vision_Live/
+├── Vision_Live.ipynb        le notebook : TOUT le code est ici (19 cellules)
+├── lancer_vision.py         exécute les cellules du notebook puis ouvre la fenêtre
+├── vision_live.sh           lancé par l'icône du bureau (écrit dans logs/lanceur.log)
+├── telecharger_qwen.sh      téléchargement de Qwen avec reprise (connexion lente)
+├── models → ~/Modeles_IA    lien vers le dossier commun des modèles
+├── config/                  réglages : zones*.json, telegram.json, tracker.yaml, iphone_adresse.txt
+├── dataset/                 tes corrections : exemples.jsonl, signatures.pt, adaptateur.pt,
+│                            images/ + labels/ (format YOLO), crops/, classes.json, data.yaml
+├── memoire/                 ou_sont_les_objets.json, objets_perso.npz, vignettes/
+├── evenements/              une alerte = un dossier (image, clip, visage, description, info)
+├── captures/                captures d'écran (S) et vidéos (R)
+├── logs/                    lanceur.log + un fichier session_*.csv par lancement
+├── bench/                   les tests : test_vignettes.py, test_surveillance.py, ...
+├── sauvegardes/             UNE copie du notebook (remplacée à chaque mise à jour)
+└── docs/                    ce guide et le programme qui le fabrique
+```
+
+## Les cellules du notebook
+
+%cols 8,30,62
+| N° | Titre dans le notebook | Ce qu'elle contient |
+|---|---|---|
+| 0 | (texte) | Présentation, mode d'emploi, touches |
+| 1 | Lancement rapide | `%run lancer_vision.py` : tout charger et ouvrir la fenêtre |
+| 2 | 1) Installation | `%pip install ultralytics lap` (une seule fois) |
+| 3 | 2) Configuration | Dossiers, `CONFIG`, réglages du suivi (`tracker.yaml`), petites fonctions |
+| 4 | 3) Vocabulaire | Les ~230 objets, rangés en 16 catégories (anglais → français) |
+| 5 | 4) Le Cerveau | Classe `Cerveau` : YOLOE, signatures texte, objets perso, prototypes |
+| 6 | 4b) Le Vérificateur | Classe `Verificateur` : MobileCLIP2, phrases, rejets, thread |
+| 7 | 4c) Apprentissage | Classe `Apprentissage` : mémoire (niveau 2), adaptateur (niveau 3), dataset |
+| 8 | 5) Caméras | `Camera`, `trouver_iphone`, `adapter`, `recadrer` |
+| 9 | 6) Moteur graphique | Couleurs, cadres, contours, modes Spotlight / Heatmap / Nuit |
+| 10 | 6b) Vidéo H.264 | Classe `VideoH264` (touche R) |
+| 11 | 7) Stabilisation, Journal, Mémoire, Mission | `Stabilisateur`, `Journal`, `Memoire`, `Mission` |
+| 12 | 7b) Perception | `decider()` et classe `Perception` : le cœur de la vision |
+| 13 | 7c) Surveillance | `Zones`, `REGLES`, `Alertes` (Telegram), `Enregistreur`, `Surveillance` |
+| 14 | 8) Voix | `Parole` (synthèse), `Voix` (Whisper), `comprendre()` |
+| 15 | 8b) Niveau 4 : Expert | `Expert` (Qwen dans un thread), `SurveillanceExperte` |
+| 16 | 9) Panneau latéral | `dessiner_panneau()` : le tableau de bord à droite |
+| 17 | 10) Boucle principale | `executer()` et `lancer()` : la fenêtre, le clavier, la souris |
+| 18 | 11) Lancer | `lancer()` |
+
+:::attention Le notebook est la seule source
+`lancer_vision.py` **relit le notebook sur le disque** à chaque lancement. Si tu modifies une cellule sans enregistrer (Ctrl+S), l'icône du bureau lance encore l'ancienne version.
+:::

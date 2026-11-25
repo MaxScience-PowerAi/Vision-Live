@@ -1,0 +1,109 @@
+# Partie 2 — Les notions de base
+
+Ce chapitre explique les idées sur lesquelles tout le reste repose. Si tu les comprends, le code devient facile à lire.
+
+## Une image, pour l'ordinateur
+
+Une image, c'est un **tableau de nombres**. Une image 1280 × 720 contient 720 lignes de 1280 pixels ; chaque pixel a 3 nombres entre 0 et 255 (sa quantité de bleu, de vert et de rouge). En Python, c'est un tableau `numpy` de forme `(720, 1280, 3)`.
+
+- **OpenCV range les couleurs en BGR** (bleu, vert, rouge), alors que presque tout le reste (PIL, MobileCLIP2, Qwen) attend du **RGB**. D'où les conversions `cv2.cvtColor(img, cv2.COLOR_BGR2RGB)` et `image[:, :, ::-1]` (inverser l'ordre des 3 couleurs) dans le code.
+- Les couleurs du code sont donc écrites en BGR : `ROUGE = (60, 60, 255)` veut dire « beaucoup de rouge », car le rouge est le 3e nombre.
+- Les coordonnées partent du **coin en haut à gauche** : `x` va vers la droite, `y` vers le **bas**.
+- Une **boîte** (un rectangle autour d'un objet) s'écrit `(x1, y1, x2, y2)` : coin haut gauche et coin bas droit. C'est le format `xyxy`.
+
+## Classification, détection, segmentation
+
+- **Classification** : « cette image contient un chat ». Une seule réponse pour toute l'image.
+- **Détection** : « il y a un chat ICI (boîte) et un téléphone LÀ ». Plusieurs objets, chacun avec sa boîte, son nom et un **score de confiance** entre 0 et 1.
+- **Segmentation** : en plus de la boîte, le **masque** exact : quels pixels appartiennent à l'objet. C'est ce qui permet de dessiner le contour précis et de « griser » le fond avant la vérification.
+
+YOLOE fait de la **détection + segmentation**. MobileCLIP2 (le vérificateur) fait de la **classification** sur la petite image de chaque objet.
+
+## Un réseau de neurones, simplement
+
+Un réseau de neurones est une énorme fonction mathématique : il prend des nombres en entrée (les pixels) et rend des nombres en sortie (des scores). Il contient des millions de **paramètres** (des « poids ») qui règlent son comportement.
+
+- **Entraîner** = ajuster les poids pour que les sorties soient justes sur des milliers d'exemples. C'est long et coûteux. Les auteurs de YOLOE, MobileCLIP2, Whisper et Qwen l'ont fait pour nous sur des millions d'exemples.
+- **Inférence** = utiliser le réseau déjà entraîné pour répondre. C'est ce que fait Vision Live à chaque image.
+- Notre **adaptateur** (chapitre Apprentissage) est un tout petit réseau qu'on entraîne nous-mêmes, en 0,2 seconde, sur tes 77 corrections.
+
+### Comment on entraîne : la descente de gradient
+
+1. On fait passer les exemples dans le réseau → il donne des réponses.
+2. On mesure l'erreur avec une **fonction de perte** (« loss »). Pour choisir entre des noms, on utilise l'**entropie croisée** : elle est petite quand le réseau donne une forte probabilité au bon nom.
+3. PyTorch calcule automatiquement, pour chaque poids, dans quel sens il faut le bouger pour diminuer l'erreur : c'est le **gradient** (`perte.backward()`).
+4. Un **optimiseur** (ici **Adam**) bouge chaque poids d'un petit pas dans le bon sens (`opt.step()`). La taille du pas s'appelle le **taux d'apprentissage** (`lr = 0.001`).
+5. On recommence. Un passage sur tous les exemples s'appelle une **époque** ; on en fait 60.
+
+## Les signatures (« embeddings ») : l'idée la plus importante
+
+Un modèle comme MobileCLIP2 transforme une image **ou une phrase** en une liste de **512 nombres** : sa **signature** (en anglais *embedding*). La magie : il a été entraîné pour que l'image d'un téléphone et la phrase « a photo of a cell phone » aient des signatures **proches**.
+
+On normalise chaque signature pour qu'elle ait une **longueur de 1** (`torch.nn.functional.normalize`). Alors, pour comparer deux signatures, il suffit de calculer leur **produit scalaire** : multiplier les nombres deux à deux et tout additionner. Le résultat est le **cosinus de l'angle** entre les deux : 1 = identiques, 0 = sans rapport.
+
+[[fig:espace|128]]
+
+Dans le code, `I @ T.T` calcule d'un coup le produit scalaire de chaque signature d'image (`I`) avec chaque signature de texte (`T`) : le symbole `@` est la **multiplication de matrices**.
+
+:::retenir Pourquoi c'est si utile
+Avec des signatures, **comparer devient trivial**. YOLOE cherche les objets dont la signature ressemble à celles des textes du vocabulaire. Le vérificateur compare la découpe d'un objet à ~240 phrases. La mémoire de tes corrections compare un objet à tes 77 exemples. L'objet perso (touche A) est une signature d'image que YOLOE cherche comme un mot. **C'est le même principe partout.**
+:::
+
+## Des scores aux probabilités : softmax
+
+Le vérificateur obtient un score de ressemblance pour chaque nom. Pour les transformer en **probabilités** (positives, qui font 100 % au total), on utilise la fonction **softmax** :
+
+```
+proba(nom i) = exp(échelle × score_i) / somme sur tous les noms de exp(échelle × score_j)
+```
+
+L'**échelle** (`logit_scale`, apprise par le modèle, ici `self.echelle`) écarte les scores : sans elle, des ressemblances de 0,30 et 0,28 donneraient des probabilités presque égales ; avec elle (environ 100), le meilleur nom ressort nettement.
+
+## Le suivi d'objets (« tracking »)
+
+Le détecteur regarde chaque image **séparément** : il ne sait pas que le téléphone de l'image 41 est le même que celui de l'image 40. Le **suivi** (ici **BoT-SORT**, fourni par Ultralytics) fait le lien :
+
+1. Il **prédit** où chaque objet déjà connu devrait être (filtre de Kalman : il suppose un mouvement régulier).
+2. Il **associe** les nouvelles boîtes aux objets connus, en maximisant le recouvrement entre boîtes (l'**IoU** : surface commune / surface totale). Cette association optimale est calculée par la bibliothèque `lap`.
+3. Une boîte sans partenaire devient un **nouvel objet** avec un nouveau numéro ; un objet sans boîte est gardé `track_buffer = 60` images (environ 2 s) avant d'être oublié.
+
+On a coupé la ré-identification par l'apparence (« ReID ») : son mode `auto` plante avec YOLOE.
+
+## La carte graphique (GPU), la mémoire et les nombres plus petits
+
+- Le **GPU** fait des milliers de multiplications en parallèle : c'est pour ça que les réseaux de neurones y tournent 10 à 50 fois plus vite que sur le processeur (CPU).
+- Il a sa **propre mémoire** (VRAM) : 5,6 Go utilisables ici. Tout modèle sur le GPU y occupe de la place. Si elle déborde : erreur **`OutOfMemoryError`**.
+- **FP32 / FP16** : un nombre « normal » prend 32 bits (4 octets). En **FP16** (16 bits), il prend 2 fois moins de place et le calcul va plus vite, avec une précision suffisante. YOLOE, MobileCLIP2 et Whisper tournent en FP16 (`quantize: 16`, `dtype=torch.float16`).
+- **Quantification 4 bits** : on compresse encore plus les poids de Qwen (bibliothèque `bitsandbytes`). 4 milliards de paramètres × 4 bits ≈ 2 Go pour les poids principaux ; Qwen occupe au total environ 4,3 Go au lieu d'environ 9 en FP16.
+- **BF16** : un autre format 16 bits que la Quadro RTX 3000 ne gère pas bien → on le convertit en FP16 (voir partie 4).
+
+## Mesurer honnêtement : précision et validation croisée
+
+- **Précision** (dans ce projet) : parmi les noms affichés, combien sont justes.
+- **Vérité terrain** : les bonnes réponses, annotées **à la main** (fichier `bench/verite_terrain.json`, 74 vignettes réelles).
+- **Validation croisée** (5 plis) : pour mesurer l'apprentissage sans tricher, on coupe les 74 exemples en 5 paquets ; on entraîne sur 4 paquets et on teste sur le 5e, et on recommence 5 fois. Ainsi, aucun exemple n'est jugé par un système qui l'a déjà vu.
+
+:::attention Le piège qu'on a évité
+Si on testait l'apprentissage sur les exemples qui ont servi à l'entraîner, on obtiendrait presque 100 % : le système les « connaît par cœur ». Ce chiffre ne voudrait rien dire. D'où la validation croisée.
+:::
+
+## Les threads, les files et les verrous (rappel)
+
+- **Thread** : un fil d'exécution parallèle. `threading.Thread(target=f, daemon=True).start()` lance `f` à côté ; `daemon=True` veut dire qu'il s'arrête avec le programme.
+- **File** (`queue.Queue`) : boîte aux lettres entre threads. `put()` dépose, `get()` attend un message. `put_nowait()` dépose sans attendre, et lève `queue.Full` si la file est pleine.
+- **Verrou** (`threading.Lock`) : `with verrou:` → un seul thread à la fois dans ce bloc.
+- **Événement** (`threading.Event`) : un thread attend (`wait(90)`) qu'un autre lui fasse signe (`set()`). Utilisé par la commande Telegram `/scene`.
+
+## Les formats de fichiers utilisés
+
+%cols 18,82
+| Format | Où et pourquoi |
+|---|---|
+| `.json` | Réglages et mémoires lisibles : zones, Telegram, « où sont les objets », infos des alertes |
+| `.jsonl` | Un objet JSON **par ligne** : on peut **ajouter** une ligne sans réécrire tout le fichier (corrections, alertes en attente) |
+| `.pt` | Tenseurs PyTorch sauvegardés : signatures, adaptateur, caches |
+| `.npz` | Tableaux numpy compressés : signatures des objets perso |
+| `.csv` | Tableau texte : journal de chaque session (heure, objet, confiance) |
+| `.yaml` | Réglages lisibles : `tracker.yaml` (suivi), `data.yaml` (dataset YOLO) |
+| `.mp4` H.264 | Vidéos lisibles sur téléphone, WhatsApp, VLC |
+| `.safetensors`, `.onnx` | Poids des modèles (Qwen ; Piper et YuNet) |

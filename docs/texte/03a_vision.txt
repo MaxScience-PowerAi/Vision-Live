@@ -1,0 +1,257 @@
+# Partie 3 — Le code, cellule par cellule
+
+## La configuration (cellule « 2) Configuration »)
+
+Cette cellule prépare tout ce dont les autres ont besoin.
+
+**Variables d'environnement** : réglages lus par les bibliothèques avant de démarrer.
+
+- `QT_QPA_PLATFORM=xcb` : la fenêtre OpenCV passe par XWayland, plus fiable sous Wayland.
+- `HF_HUB_OFFLINE=1` et `TRANSFORMERS_OFFLINE=1` : interdit à Hugging Face d'aller vérifier sur internet. Tout est sur le disque, et sans ce réglage le démarrage attendait la connexion.
+
+**Les dossiers** (`PROJET`, `MODELES`, `CAPTURES`, `LOGS`, `MEMOIRE`, `REGLAGES`) sont des objets `Path` : `PROJET / "captures"` construit un chemin proprement. `mkdir(parents=True, exist_ok=True)` les crée s'ils n'existent pas.
+
+**Le dictionnaire `CONFIG`** regroupe tous les réglages. Les autres cellules en ajoutent avec `CONFIG.update({...})`. Les plus importants :
+
+%cols 24,12,64
+| Réglage | Valeur | Signification |
+|---|---|---|
+| `imgsz` / `imgsz_hd` | 640 / 960 | Taille à laquelle YOLOE regarde l'image. 960 (touche H) voit mieux les petits objets mais est plus lent. |
+| `conf` | 0.30 | Seuil d'**affichage** : un objet suivi n'apparaît que si sa confiance lissée dépasse 0,30. |
+| `conf_suivi` | 0.10 | Seuil donné au **suivi** : il garde les objets même si leur score baisse un instant. |
+| `age_min` | 3 | Un objet n'apparaît qu'après 3 images d'affilée (élimine les fausses détections d'une seule image). |
+| `vote` | 15 | Nombre d'images sur lesquelles on vote le nom d'un objet. |
+| `verif_rejet`, `verif_top_rejet` | 0.40 / 0.40 | « Non-objet » à plus de 40 % et aucun objet à plus de 40 % → rejeté. |
+| `verif_perdu` | 0.20 | Le vérificateur ne reconnaît aucun objet à plus de 20 % → rejeté. |
+| `verif_alpha` | 0.50 | Poids de l'avis de YOLOE quand on départage les propositions du vérificateur. |
+| `verif_doute` | 0.60 | Si le 2e nom vaut plus de 60 % du 1er → affichage « catégorie (nom ?) ». |
+| `memoire_seuil`, `memoire_k` | 0.88 / 3 | Mémoire des corrections : on regarde les 3 exemples les plus proches ; ressemblance ≥ 0,88 = on suit ta correction. |
+| `entrainement_*` | 8 / 10 / 60 / 0.10 | Au moins 8 exemples ; réentraînement auto toutes les 10 corrections ; 60 époques ; régularisation 0,1. |
+| `proto_min`, `proto_poids` | 3 / 0.50 | Objet corrigé ≥ 3 fois → sa signature dans YOLOE devient 50 % texte + 50 % tes images. |
+| `device`, `quantize` | 0 / 16 | Calcul sur le GPU n° 0, en FP16. |
+
+Les valeurs de vérification (0,40, 0,20, 0,50, 0,60) **ne sont pas inventées** : elles ont été choisies en mesurant sur les 74 vignettes réelles annotées (`bench/test_vignettes.py`).
+
+**Le fichier `tracker.yaml`** règle BoT-SORT : `track_high_thresh: 0.25` (score pour une association sûre), `track_low_thresh: 0.10` (accepte les scores bas pour un objet déjà suivi), `new_track_thresh: 0.35` (score pour créer un nouvel objet), `track_buffer: 60` (images de patience), `match_thresh: 0.80`, `with_reid: False`.
+
+Deux petites fonctions servent partout : `dans_dossier(d)` exécute un bloc dans un autre dossier (Ultralytics cherche l'encodeur de texte dans le dossier courant), et `sans_accents(s)` enlève les accents (la police d'OpenCV ne sait pas les dessiner).
+
+## Le vocabulaire (cellule « 3) »)
+
+YOLOE est un détecteur à **vocabulaire ouvert** : il ne connaît pas une liste fixe de classes ; on lui **donne** les objets à chercher sous forme de texte. Le dictionnaire `CATEGORIES` contient environ 230 objets en **16 catégories** (personne, accessoire, électronique, cuisine, aliment, animal...), chacun avec son nom anglais (pour le modèle) et français (pour l'affichage) :
+
+```
+"électronique": {"cell phone": "téléphone", "usb flash drive": "clé USB", "laptop": "ordinateur portable", ...}
+```
+
+Deux dictionnaires sont fabriqués à partir de lui : `VOCAB` (anglais → français) et `CATEGORIE_DE` (français → catégorie). La catégorie sert quand le système hésite entre deux voisins de la même famille : il affiche `aliment (pain ?)`.
+
+:::attention Les règles du vocabulaire
+**Pas de doublons** (« phone » et « smartphone ») et **rien de trop vague** (« main », « mur ») : les classes se « volent » les détections entre elles et la précision baisse. On a ajouté des objets locaux (manioc, plantain, piment, chaise en plastique, éventail...) parce que le projet vise un usage réel.
+:::
+
+## Le Cerveau : YOLOE (cellule « 4) »)
+
+### Ce qu'est YOLOE
+
+**YOLO** (« You Only Look Once ») est une famille de détecteurs qui regardent l'image **une seule fois** et sortent toutes les boîtes d'un coup : c'est ce qui les rend rapides. **YOLOE-11m-seg** est la version « m » (medium) avec segmentation et vocabulaire ouvert :
+
+- Chaque objet à chercher est décrit par une **signature de texte** (512 nombres), calculée par un encodeur de texte (`mobileclip_blt.ts`).
+- Pour chaque zone de l'image, YOLOE calcule une signature visuelle et la compare aux signatures de texte : la plus proche donne la classe.
+- On peut aussi lui donner une **signature d'image** à la place d'un texte : c'est le « prompt visuel ». C'est ce qu'on utilise pour tes objets perso.
+
+### La classe `Cerveau`
+
+Elle tient la **liste de tout ce que YOLOE cherche** et la recharge quand elle change. Cette liste a 4 sources :
+
+1. le **vocabulaire** (cellule 3) ;
+2. tes **objets perso** (`self.perso` : nom → signature, appris avec la touche A) ;
+3. les **recherches libres** (« trouve une bouteille bleue » ajoute « bouteille bleue ») ;
+4. les **prototypes** (niveau 3) : pour les objets que tu as corrigés au moins 3 fois.
+
+La méthode clé est `appliquer()` :
+
+```
+textes = list(VOCAB) + [recherches libres]
+pe = self._textes(textes)                                   # une signature par texte (avec cache disque)
+for i, nom in enumerate(noms):                               # niveau 3
+    if nom in self.prototypes:
+        b = CONFIG["proto_poids"]                            # 0.5
+        pe[i] = normalize((1 - b) * pe[i] + b * self.prototypes[nom])
+pe = torch.cat([pe, signatures des objets perso])
+self.model.set_classes([f"c{i}" ...], pe)                     # YOLOE cherche maintenant ces signatures
+self.generation += 1                                         # « la liste a changé »
+```
+
+- **Le cache** (`cache_textes.pt`) : calculer la signature d'un texte prend du temps ; on la garde sur le disque.
+- **Le prototype** mélange le texte et la moyenne de tes images : la classe s'adapte à **ton** éclairage et à **tes** objets. On a mesuré : avec 30 % d'images, aucun effet ; 50 %, la classe corrigée passe devant (0,63 contre 0,37) ; 70 %, trop (il oublie le texte).
+- **`generation`** : un compteur. Quand la liste change, le suivi et le vérificateur doivent repartir à zéro (les numéros de classe ont bougé). Chaque Perception compare `cerveau.generation` à la sienne.
+
+### Apprendre un objet perso (touche A)
+
+`embedding_visuel(frame, boite)` utilise `YOLOEVPSegPredictor` d'Ultralytics : on lui donne l'image et la boîte que tu as dessinée, il rend la signature visuelle de cette zone (`get_vpe`). Avec plusieurs exemples du même objet, on fait une **moyenne pondérée** (puis on renormalise) :
+
+```
+moyenne = normalize(ancienne_moyenne × n + nouvelle_signature)
+```
+
+La signature est sauvegardée dans `memoire/objets_perso.npz` et l'objet apparaît en **doré**. `oublier(nom)` le retire.
+
+Au démarrage, la cellule fait un **préchauffage** (3 prédictions à vide) puis mesure la vitesse : environ 26 ms par image à 640.
+
+:::oral YOLOE en une phrase
+« J'utilise YOLOE, un détecteur à vocabulaire ouvert : au lieu d'être limité à 80 classes, je lui donne ma propre liste de 230 objets en texte, et même des objets montrés à la souris. Il les trouve et les détoure en environ 26 millisecondes par image sur ma carte graphique. »
+:::
+
+## Le Vérificateur : MobileCLIP2 (cellule « 4b) »)
+
+### Pourquoi un deuxième regard
+
+YOLOE est rapide mais se trompe souvent sur les petits objets : sur 74 détections réelles de ta session, **seulement 19 % de noms justes**. Il prend une main pour un objet, un cordon pour un câble, un téléphone pour une télécommande. Il regarde toute l'image réduite à 640 pixels ; l'objet n'y fait que quelques pixels.
+
+Le **vérificateur** regarde chaque objet **de près**, en pleine résolution, et seulement ses pixels.
+
+### MobileCLIP2
+
+**CLIP** (OpenAI, 2021) est un modèle entraîné sur des centaines de millions de paires (image, légende) pour que l'image et sa légende aient des signatures proches. **MobileCLIP2-S2** est une version légère d'Apple. On lui demande : « parmi ces ~240 phrases, laquelle décrit le mieux cette découpe ? ».
+
+### Les phrases et les rejets
+
+Chaque nom est décrit par **4 phrases**, dont on fait la moyenne des signatures (« ensemble de prompts », plus robuste qu'une seule phrase) :
+
+```
+PHRASES = ["a photo of a {}.", "a close-up photo of a {}.",
+           "a photo of a {} held in a hand.", "a low-light photo of a {}."]
+```
+
+On ajoute 10 **« non-objets »** (`REJETS`) : « a blurry photo », « a plain painted wall », « a dark shadow », « a human hand », « a patch of human skin »... Si la découpe ressemble surtout à ça, ce n'est pas un objet.
+
+### Découper l'objet proprement
+
+`decouper(frame, boite, parts)` :
+
+1. agrandit la boîte de 8 % (un peu de contexte) ;
+2. si on a le **masque** de segmentation, tout ce qui n'est pas l'objet devient **gris** (127). Le masque est d'abord élargi (`cv2.dilate`, 9 × 9). Sans ça, un cordon posé sur un polo était « noyé » dans le polo ;
+3. convertit en RGB.
+
+### Le calcul
+
+```
+I = normalize(model.encode_image(découpes))                  # signatures des découpes
+si adaptateur entraîné :  I = normalize(I + I @ W)            # niveau 3 (cellule 4c)
+probas = softmax(échelle × I @ textes.T)                     # [~230 classes..., 10 rejets]
+```
+
+### Le thread du vérificateur
+
+La boucle principale ne vérifie pas elle-même : elle **dépose** la demande dans une file (`demander`, 64 places, on saute si pleine). Le thread `_boucle` :
+
+1. prend jusqu'à **16 demandes d'un coup** (un lot : le GPU est bien plus efficace sur 16 images que 16 fois sur 1) ;
+2. ignore celles d'une ancienne `generation` ;
+3. calcule les probabilités et le **souvenir** (mémoire de tes corrections) ;
+4. fait la **moyenne** avec les vérifications précédentes du même objet (`p = (ancien × k + nouveau) / (k + 1)`) : plus l'objet est regardé, plus l'avis est sûr ;
+5. range le résultat dans `self.res[uid]`, que la Perception relit.
+
+Mesure : 16 objets vérifiés en quelques dizaines de millisecondes. Sur les 74 vignettes : **19 % → 59 %** de noms justes, et 19 fausses détections sur 24 écartées.
+
+:::attention Le bug du tokenizer
+Le « tokenizer » découpe une phrase en numéros de mots. Celui fourni avec MobileCLIP2 remplissait la fin des phrases avec le numéro 49407 : **toutes les phrases devenaient presque identiques** et le vérificateur ne servait à rien. Solution : utiliser le tokenizer CLIP standard, `open_clip.get_tokenizer("ViT-B-32")`.
+:::
+
+## L'Apprentissage : niveaux 2 et 3 (cellule « 4c) »)
+
+La classe `Apprentissage` transforme **tes corrections** en amélioration. Une correction = « cet objet-là, c'est un cordon badge » ou « ce n'est pas un objet » (`REJET`).
+
+### Ce qui est enregistré à chaque correction (`ajouter`)
+
+1. La **découpe** de l'objet → `dataset/crops/<id>.jpg`.
+2. Sa **signature MobileCLIP2** `E` (pour la mémoire et l'adaptateur).
+3. Sa **signature visuelle YOLOE** `V` (pour les prototypes).
+4. Si ce n'est pas un rejet : l'**image entière** → `dataset/images/` et ses **étiquettes au format YOLO** → `dataset/labels/` (l'objet corrigé + les autres objets sûrs de l'image).
+5. Une ligne dans `exemples.jsonl` : `{"id", "nom", "boite", "source", "date"}`.
+
+Le **format YOLO** : une ligne par objet, `classe x_centre y_centre largeur hauteur`, en **fractions** de la taille de l'image (entre 0 et 1) :
+
+```
+3 0.512000 0.430556 0.120313 0.211111
+```
+
+C'est le format standard pour entraîner un détecteur YOLO plus tard (fichier `data.yaml` prêt). Il faudra environ 300 images ; on en a 3.
+
+### Niveau 2 : la mémoire (effet immédiat)
+
+`souvenir(I)` : pour chaque objet vu, on cherche les **3 exemples corrigés les plus proches** (produit scalaire avec toutes les signatures `E`, puis `topk(3)`). Chaque exemple dont la ressemblance dépasse **0,88** vote pour son nom, avec un poids égal à sa ressemblance. S'il y a des votes, le nom gagnant est renvoyé avec la ressemblance.
+
+C'est un algorithme des **k plus proches voisins** (kNN). Pas d'entraînement : dès que tu corriges, le prochain objet qui ressemble suit ta correction et s'affiche avec « (appris) ».
+
+### Niveau 3 : l'adaptateur (un petit entraînement)
+
+[[fig:adaptateur|80]]
+
+L'adaptateur est une matrice **W de 512 × 512** qui « tord » légèrement l'espace des signatures pour que **tes** objets tombent plus près de **leurs** noms :
+
+```
+Z = normalize(X + X @ W)                                     # X = signatures de tes exemples
+perte = cross_entropy(échelle × Z @ Tc.T, bons_noms) + 0.1 × somme(W²)
+```
+
+- **Résiduel** : on ajoute `X @ W` à `X`, au lieu de remplacer `X`. Comme W part de **zéro**, au début rien ne change ; l'adaptateur n'apprend que la **correction** nécessaire.
+- **Régularisation** (`0.1 × somme(W²)`) : elle punit les grosses valeurs de W, donc l'adaptateur reste **proche du modèle d'origine** et n'« oublie » pas les objets que tu n'as jamais corrigés.
+- Les 10 rejets sont fusionnés en **une seule classe « REJET »** (moyenne de leurs signatures).
+- Optimiseur **Adam**, `lr = 0.001`, **60 époques**, sur le GPU : environ **0,2 seconde**.
+- W est sauvegardé dans `dataset/adaptateur.pt`. Il est réentraîné à chaque lancement, tout seul toutes les 10 corrections, et avec la touche U.
+
+### Les exemples publics : Open Images
+
+Problème mesuré : entraîné **seulement sur ta chambre**, l'adaptateur se spécialise trop. Sur des images d'ailleurs, il fait **baisser** le vérificateur de 76 à 73 % de noms justes. Pour un produit vendu à d'autres, c'est un défaut.
+
+Solution (31/10) : on ajoute des **exemples publics** tirés d'**Open Images V7** (Google, licence CC-BY) :
+
+1. `bench/choisir_open_images.py` : les 600 classes d'Open Images sont associées à notre vocabulaire (137 noms trouvés, avec un dictionnaire de synonymes : « Mobile phone » → téléphone, « Houseplant » → plante en pot...). Au plus 25 images par nom, en commençant par les noms rares : **1 544 images** (433 Mo), téléchargées par `bench/telecharger_open_images.sh` (8 à la fois, avec reprise).
+2. `bench/encoder_open_images.py` : chaque objet est découpé **comme dans Vision Live** (`decouper`), au plus 40 par nom, puis sa signature MobileCLIP2 est calculée : **3 187 exemples** dans `dataset/open_images/signatures.pt`. 20 % des images sont **mises de côté** pour la mesure.
+3. L'adaptateur s'entraîne sur tes corrections **et** sur ces exemples, avec une **perte pondérée** : chaque exemple public compte **0,05** fois une de tes corrections (`CONFIG["public_poids"]`). La **mémoire** (niveau 2), elle, reste faite de tes seules corrections.
+
+```
+perte = somme(erreur_i × poids_i) / somme(poids_i) + 0.1 × somme(W²)
+# poids_i = 1 pour tes corrections, 0.05 pour un exemple public
+```
+
+Pourquoi 0,05 ? On a mesuré plusieurs poids (`bench/test_open_images.py`). Avec un poids plus fort, le système se met à moins bien rejeter les mains et le flou de ta pièce (les exemples publics ne contiennent aucun « non-objet ») :
+
+%cols 22,26,20,32
+| Poids public | Tes 74 vignettes | Intrus évités | Objets d'Open Images jamais vus |
+|---|---|---|---|
+| 0 (avant) | 80 % | 19/24 | 73 % (4 % de faux rejets) |
+| **0,05 (choisi)** | **79 %** | **18/24** | **79 % (2 % de faux rejets)** |
+| 0,2 | 78 % | 16/24 | 80 % |
+| 1 | 72 % | 17/24 | 80 % |
+
+Bilan honnête : **dans ta pièce, c'est pareil** (une vignette d'écart, c'est du bruit sur 49) ; **ailleurs, +6 points**. YOLOE n'a pas été réentraîné : il perdrait son vocabulaire ouvert.
+
+### YOLOE apprend aussi l'apparence réelle des objets (Open Images)
+
+Avec les mêmes images, on améliore le **détecteur** sans le réentraîner (`bench/yoloe_open_images.py`) : pour chaque objet des images d'entraînement, YOLOE calcule sa **signature visuelle** (prompt visuel) ; on fait la moyenne par nom (au plus 40 objets, au moins 3) → **128 prototypes** dans `dataset/open_images/prototypes_yoloe.pt`. Le Cerveau mélange chaque signature texte à 50 % avec ce prototype (`CONFIG["proto_public_poids"]`). Le vocabulaire reste ouvert : les 227 objets, les recherches libres et tes objets perso marchent toujours.
+
+%cols 22,39,39
+| Poids des images | Objets retrouvés (571 objets jamais vus) | Noms justes (détections posées sur un objet) |
+|---|---|---|
+| 0 (texte seul, avant) | 40,5 % | 57,2 % |
+| 0,3 | 54,6 % | 60,1 % |
+| **0,5 (choisi)** | **59,4 %** | **62,0 %** |
+| 0,7 | 58,7 % | 61,5 % |
+
+« Retrouvé » = une détection du bon nom recouvre l'objet (IoU ≥ 0,5, score ≥ 0,25). Ce gain est mesuré sur des images d'Open Images ; dans ta pièce, il n'est **pas encore mesuré**.
+
+### Niveau 3 bis : les prototypes dans YOLOE
+
+À la fin de `entrainer()`, pour chaque nom corrigé **au moins 3 fois** (et qui n'est pas un objet perso), on fait la moyenne de ses signatures YOLOE `V` : c'est son **prototype**. Le Cerveau le mélange à 50 % avec la signature texte. Ainsi le **détecteur lui-même** s'adapte, pas seulement le vérificateur.
+
+### L'apprentissage actif (touche E)
+
+Quand la Perception hésite (`incertain`) sur un objet vérifié, elle appelle `proposer()` : l'image, la boîte et les 3 propositions vont dans une file `a_revoir` (100 au maximum, un même objet une seule fois). Avec E, le système **te montre ce dont il n'est pas sûr** et tu réponds 1, 2, 3, X ou tu tapes le nom. C'est l'**apprentissage actif** : il te demande les exemples qui lui apprennent le plus.
+
+[[fig:precision|150]]
+
+:::oral L'apprentissage en 30 secondes
+« Quand je corrige un objet, le système garde sa signature. Niveau 2 : dès qu'un objet ressemble à plus de 88 % à une de mes corrections, il la suit, sans entraînement. Niveau 3 : il entraîne en 0,2 seconde un petit adaptateur résiduel de 512 par 512 sur mes exemples, avec une régularisation pour ne pas oublier le reste, et il adapte aussi les signatures du détecteur pour les objets corrigés trois fois. Mesuré en validation croisée sur 74 détections réelles : de 59 à 80 % de noms justes. »
+:::

@@ -1,0 +1,167 @@
+# La Perception : le cœur de la vision
+
+## Le chemin d'une détection (cellule « 7b) »)
+
+La classe `Perception` transforme **une image** en **une liste d'objets fiables**. Il y en a **une par caméra** : chacune a son propre suivi. YOLOE, lui, est partagé.
+
+[[fig:chemin|150]]
+
+### Étape 1 : YOLOE + suivi
+
+```
+model.predictor = self.predictor             # on remet le suivi de CETTE caméra
+res = model.track(frame, persist=True, tracker="tracker.yaml", conf=0.10, imgsz=640, quantize=16)[0]
+self.predictor = model.predictor             # on garde son état pour la prochaine image
+```
+
+`persist=True` garde la mémoire du suivi d'une image à l'autre. Comme YOLOE est partagé entre les caméras, on **échange** son « predictor » (qui contient le suivi) avant chaque caméra : sinon les objets de la webcam et de l'iPhone se mélangeraient.
+
+Pour chaque objet, on obtient : la boîte (`xyxy`), la classe, le score, le **numéro de suivi** et le masque. `contours_masques()` (cellule 6) transforme le masque en contours (avec `cv2.findContours`).
+
+**Numéros uniques** : `uid = numéro_du_suivi + offset`. La webcam commence à 0, l'iPhone à 10 000 000 (`base = i × 10_000_000`). Quand la liste des classes change, l'offset avance après le plus grand numéro déjà vu : un nouvel objet ne peut jamais hériter du nom d'un ancien.
+
+**Carte graphique pleine** : si `model.track` lève `OutOfMemoryError`, on vide le cache du GPU et on **saute cette image** (on renvoie une liste vide) au lieu de planter. Message dans le journal à la 1re, 10e et 100e fois.
+
+### Étape 2 : le vote (`Stabilisateur`, cellule 7)
+
+Chaque objet garde ses **15 dernières** paires (classe, score). La classe dont la **somme des scores** est la plus grande gagne. Résultat : le nom ne « saute » plus entre téléphone, télécommande et clé USB d'une image à l'autre. Le stabilisateur compte aussi l'**âge** de l'objet (nombre d'images où il a été vu).
+
+### Étape 3 : confiance lissée, âge et hystérésis
+
+```
+ema = score                      (1re fois)
+ema = 0.7 × ema + 0.3 × score    (ensuite)          # moyenne mobile exponentielle (EMA)
+seuil = 0.30 × (0.6 si l'objet a déjà été affiché, sinon 1.0)
+on ignore l'objet si âge < 3 ou ema < seuil
+```
+
+- L'**EMA** lisse le score : un mauvais score isolé ne fait pas disparaître l'objet.
+- L'**hystérésis** : il faut 0,30 pour **apparaître**, mais seulement 0,18 pour **rester**. Sans ça, un objet au score proche de 0,30 clignoterait.
+
+### Étape 4 : personnes et objets perso
+
+YOLOE est très fiable sur les **personnes** et sur **tes objets perso** (appris sur ta propre image) : ils sont affichés directement, sans vérification.
+
+### Étape 5 : la vérification
+
+Pour les autres objets : 1re vérification **tout de suite**, puis une nouvelle tous les 45 âges (environ 1,5 s). Tant que le verdict n'est pas arrivé, on attend un peu avant d'afficher (jusqu'à l'âge 9, soit environ 0,2 à 0,3 s).
+
+### Étape 6 : `decider()`, l'algorithme de décision
+
+C'est la fonction la plus importante. Elle reçoit les votes de YOLOE et l'avis du vérificateur, et rend : la classe, l'étiquette affichée, « incertain ? », « rejeté ? », et les 3 meilleures propositions.
+
+1. **Votes YOLOE** → un vecteur `py` (une case par classe), divisé par son maximum : 1 pour le choix de YOLOE, moins pour les autres.
+2. **Pas encore vérifié** → on garde l'avis de YOLOE.
+3. **Souvenir** (niveau 2) : si l'objet ressemble à une de tes corrections, on la suit. Si c'était « REJET » → l'objet est caché.
+4. **Probabilités du vérificateur** : `pc` = la partie « classes », `rejet` = la somme de la partie « non-objets ». On met à zéro « personne » si YOLOE n'a pas dit personne (un vêtement porté n'est pas une personne), puis on renormalise.
+5. **Rejet** : si `rejet > 0.40` **et** le meilleur objet `< 0.40` → caché (main, flou, mur). Si le meilleur objet `< 0.20` → caché (le vérificateur ne reconnaît rien).
+6. **Fusion** : `s = pc × (0.5 + 0.5 × py)`, puis normalisation. Le vérificateur **propose**, YOLOE **départage** : une classe que YOLOE n'a jamais votée garde la moitié de son poids.
+7. **Doute** : si le 2e nom vaut plus de **60 %** du 1er → `incertain`. L'étiquette devient `catégorie (nom1 ?)` si les deux sont de la même catégorie, sinon `nom1 ?`, en couleur éteinte.
+
+Un objet incertain et vérifié est proposé à la **révision** (touche E).
+
+:::oral La Perception en 30 secondes
+« À chaque image, YOLOE propose des objets ; un suivi BoT-SORT leur donne un numéro. Pour chaque objet suivi, je vote son nom sur 15 images, je lisse son score, et il doit être vu 3 images avant d'apparaître. Ensuite un deuxième modèle, MobileCLIP2, regarde la découpe de l'objet : soit il reconnaît une de mes corrections, soit il rejette les non-objets comme les mains, soit il fusionne son avis avec celui de YOLOE. Et s'il hésite, il le dit au lieu d'inventer. »
+:::
+
+# Mémoire, journal, mission et caméras
+
+## Journal, Mémoire et Mission (cellule « 7) »)
+
+### Le Journal
+
+À chaque **nouvel** objet (vu depuis au moins 3 images), il ajoute une ligne au panneau (`+ téléphone #12`) et au fichier `logs/session_AAAAMMJJ_HHMMSS.csv` (heure, événement, numéro, objet, confiance).
+
+### La Mémoire : « où est mon téléphone ? »
+
+`Memoire` garde, pour chaque nom d'objet, **où** et **quand** il a été vu pour la dernière fois, dans `memoire/ou_sont_les_objets.json`. Elle est mise à jour au plus **toutes les 2 secondes par objet** :
+
+- une **vignette** de l'objet (boîte agrandie de 15 %) → `memoire/vignettes/vu_<nom>.jpg` ;
+- la **position** en mots, calculée à partir du centre de la boîte : à gauche si `x < 36 %` de la largeur, à droite si `> 64 %`, sinon au centre ; en haut si `y < 33 %`, en bas si `> 70 %` ;
+- l'**objet voisin le plus proche** (distance entre les centres), comme repère : « près de : ordinateur portable » ;
+- le nom de la caméra quand il y en a plusieurs ;
+- le fichier est réécrit au plus toutes les 5 secondes (pas à chaque image).
+
+`repondre(nom)` construit la phrase avec `il_y_a()` : « à l'instant », « il y a 40 secondes », « il y a 4 minutes », « aujourd'hui à 14h05 », « le 29/10 à 20h01 ».
+
+### La Mission (touche M)
+
+Un petit jeu : le système demande un objet au hasard parmi 23 (« montre-moi une cuillère ») ; il faut le garder visible 1 seconde, en moins de 30 secondes. Points : `100 + 10 × secondes restantes`.
+
+## Les caméras (cellule « 5) »)
+
+### `CONFIG["cameras"]`
+
+```
+CONFIG["cameras"] = {"webcam": 0, "iphone": "auto"}     # None = caméra désactivée
+CONFIG["rotations"] = {"iphone": 90}                     # iPhone tenu debout → image redressée
+```
+
+Une source peut être un **numéro** (webcam du PC), une **adresse** (`http://192.0.2.10:4747/video`), ou **"auto"** (iPhone trouvé tout seul).
+
+### La classe `Camera`
+
+Chaque caméra a son **thread** qui lit en boucle et ne garde que **la dernière image** (protégée par un verrou). Ainsi la vision traite toujours l'image la plus récente : pas de retard qui s'accumule.
+
+- **Webcam** : `cv2.VideoCapture(0, cv2.CAP_V4L2)`, format **MJPG** (30 images/s en HD sur la plupart des webcams), 1280 × 720.
+- **Réseau** : `cv2.VideoCapture(adresse, cv2.CAP_FFMPEG)`. Le réglage `OPENCV_FFMPEG_CAPTURE_OPTIONS = "timeout;3000000"` abandonne un flux muet au bout de **3 s** au lieu d'environ 30.
+- `BUFFERSIZE = 1` : pas de file d'images en retard.
+- **Reconnexion automatique** : si la lecture échoue, on ferme, on attend 1 s, on rouvre ; si l'ouverture échoue, on réessaie toutes les 2 s. L'autre caméra continue pendant ce temps.
+- `en_ligne` = une image reçue il y a moins de 3 s. `lire()` rend une copie de la dernière image, ou `None`.
+- `attendre(8)` au démarrage : une webcam renvoie du noir pendant qu'elle règle son exposition (on attend une image de luminosité moyenne > 15).
+- `stop()` arrête le thread et libère la caméra (utilisé aussi par la touche **D**).
+
+### Trouver l'iPhone tout seul (`trouver_iphone`)
+
+1. **Partage de connexion** : quand le PC passe par le partage de connexion de l'iPhone, l'iPhone **est** la passerelle, et son adresse commence par `172.20.10.`. La passerelle se lit dans `/proc/net/route` : la ligne dont la destination est `00000000`, adresse écrite en hexadécimal et **à l'envers** (petit-boutiste), d'où la lecture des octets dans l'ordre 6, 4, 2, 0.
+2. **La dernière adresse trouvée** (`config/iphone_adresse.txt`), si son port 4747 répond.
+3. **Balayage du réseau** : on essaie d'ouvrir le port 4747 sur les 254 adresses du réseau (`x.x.x.1` à `x.x.x.254`), **64 à la fois** (`ThreadPoolExecutor`), 0,4 s par essai. Mesuré : trouvé en environ 3 s.
+
+### Les bandes noires : `adapter()` et `recadrer()`
+
+[[fig:bandes|112]]
+
+L'iPhone tenu debout donne une image verticale ; la fenêtre est horizontale. `adapter()` réduit l'image sans la déformer et ajoute des bandes noires : on calcule `k = min(W / largeur, H / hauteur)`, la nouvelle taille, et le décalage pour centrer.
+
+:::attention Le bug des bandes noires
+Au début, on analysait l'image **après** l'avoir réduite avec les bandes noires : la personne devenait si petite que YOLOE la voyait à 0,35 au lieu de 0,92. Correction : **analyser l'image d'origine**, puis convertir les boîtes et contours vers la fenêtre avec `recadrer()` (`x' = x × k + décalage`).
+:::
+
+### Plusieurs caméras dans la boucle
+
+`lancer()` crée pour chaque caméra un dictionnaire : `Camera`, `Perception` (base 0, 10 000 000...), `Zones`, `Surveillance`, `Heatmap`, traînées, dernières détections, dernière image, et l'état « coupée ». À chaque tour, **toutes** les caméras sont analysées (la surveillance regarde partout), mais une seule est affichée en grand ; les autres apparaissent en vignette en bas à droite (cadre rouge clignotant si une alerte est en cours sur elle).
+
+- **Tab** : la caméra suivante passe en grand.
+- **D** : coupe la caméra affichée (son thread est arrêté, la webcam ou le flux est libéré, elle n'est plus analysée, plus d'alerte) ou la rallume (une nouvelle `Camera` est créée). L'arrêt se fait dans un thread pour ne pas figer la fenêtre.
+
+Mesures : 2 caméras ≈ 13-14 images/s sur secteur (environ 8,5 sur batterie) ; une seule caméra allumée ≈ 21-27 images/s.
+
+## Le moteur graphique et la vidéo (cellules « 6) » et « 6b) »)
+
+### Le dessin
+
+- **Couleur par objet** : `teinte = (somme des codes des lettres du nom × 37) mod 180`, convertie de HSV en BGR. Le même nom a donc **toujours la même couleur**, sans tableau à tenir. Personne = cyan, objets perso = or.
+- `texte()` écrit avec une ombre noire (lisible sur tout fond) ; `cadre_coins()` dessine un cadre façon viseur ; `etiquette()` un bandeau coloré avec le nom.
+- `contour()` remplit légèrement la forme exacte (`cv2.fillPoly` + `cv2.addWeighted`, transparence 18 %).
+- `contours_masques()` : on recalcule les contours nous-mêmes avec `cv2.findContours`, car `masks.xy` d'Ultralytics reliait les morceaux d'un objet par de grandes lignes parasites.
+
+### Les 4 modes (touches 1 à 4)
+
+1. **HUD** : l'image normale avec contours et étiquettes.
+2. **Spotlight** : fond en gris assombri à 22 % ; seuls les objets (leur forme exacte, adoucie par un flou gaussien) restent en couleur.
+3. **Heatmap** : une carte de chaleur des endroits où les objets apparaissent. À chaque image, la carte est multipliée par 0,985 (elle s'efface lentement) et on ajoute une ellipse par objet ; affichée avec la palette « INFERNO ».
+4. **Vision nocturne** : niveaux de gris égalisés (`equalizeHist`), grain aléatoire, une ligne sur trois assombrie, vignette sombre sur les bords, teinte verte.
+
+### L'enregistrement vidéo H.264 (touche R)
+
+`VideoH264` remplace `cv2.VideoWriter` (le cv2 installé ne sait pas écrire le H.264, le seul format lisible partout). Il utilise **PyAV** (`libx264`, `crf 23`, `preset veryfast`) dans un **thread**.
+
+Le problème : la fenêtre tourne à un rythme variable (8 à 25 images/s), mais une vidéo a un rythme fixe (15 images/s). L'algorithme garde la vidéo **à l'heure** :
+
+```
+n = round((maintenant - début) × 15) + 1 - images_déjà_écrites
+si n <= 0 : on saute cette image (la fenêtre va trop vite)
+sinon     : on écrit l'image n fois (la fenêtre va trop lentement)
+```
+
+Mesuré : 8 s filmées → 8,0 s de vidéo.
